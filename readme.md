@@ -71,19 +71,9 @@ Both tools include a `workflow_template` section containing JSON for ComfyUI wor
 Both tools require an API key and server address for authentication and communication with the ComfyUI server.
 
 1. **Set API Key:**
-   - Open the tool's Python file you added to Open-WebUI.
-   - Locate the `Valves` class and set your ComfyUI API key:
-     ```
-     self.valves = self.Valves(Api_Key="your-comfyui-api-key")
-     ```
-
-2. **Set Server Address:**
-   - Locate the `server_address` variable in the tool's Python file.
-   - Replace the placeholder with your ComfyUI server address and port:
-     ```
-     self.server_address = "your-comfyui-server-address:port"  # e.g., "localhost:8443"
-     ```
-
+   - In the Open Webui workspace settings, navigate to tools and press the gear icon next to your tool. 
+   - Enter your ComfyUI API key and server address without protocol. 
+   
 ## 🚀 Usage
 
 ### Txt2Img Tool

@@ -6,7 +6,7 @@ git_url: https://github.com/pwillia7/open-webui-tools
 description: Submits a node-based ComfyUI workflow over HTTP, then listens on the WebSocket for images from SaveImageWebsocket node. Embeds them in chat.
 required_open_webui_version: 0.4.0
 requirements: requests, langchain-openai, langgraph, ollama, langchain_ollama, websocket-client
-version: 1.0.0
+version: 1.0.1
 license: MIT
 """
 
@@ -28,32 +28,31 @@ logging.basicConfig(
 class Tools:
     """
     [LLM Usage Directive]:
+    - **Purpose**: This tool generates images using ComfyUI with a node-based workflow.
     - **When to Use**:
-        - Use this tool whenever the user explicitly asks to "generate an image,"
-          "create a Flux Image," or any similar request for an image.
-        - Example triggers: "Generate an image of a cat in space." / "Create a Flux image of a fantasy landscape."
+        - Whenever the user explicitly requests an image:
+          e.g. "Generate an image of X," "Create a flux image," "Make a flux image," etc.
     - **How to Use**:
-        - Pass the user's prompt directly as the `prompt_text` parameter to `run_comfyui_workflow`.
-        - Do not alter or parse the user's text beyond inserting it into the workflow placeholder `%%PROMPT%%`.
-    - **Behavior**:
-        - Submits a predefined ComfyUI workflow (with placeholders) to the ComfyUI server (via HTTP).
-        - Listens on a WebSocket until generation completes.
-        - Fetches the final images from `/history/<prompt_id>` and emits them into the chat via event emitters.
-    - **Examples**:
-        - "Generate an image of a futuristic city."
-        - "Make a Flux Image of a mountain sunrise."
-        - "Create an image of a medieval castle."
-    - **Important**:
-        - Only call this tool if the user wants an image.
-        - If the user wants text analysis or other tasks, do **not** invoke it.
-        - Provide the user’s prompt **verbatim** to `prompt_text`.
-
+        - Call `run_comfyui_workflow(prompt_text=USER_PROMPT)` directly.
+        - Pass the user’s text verbatim as `prompt_text`.
+        - Do **not** ask for additional clarifications or parse the prompt.
+    - **Error Handling**:
+        - If the tool raises an error, return that error message verbatim so the user knows the failure reason.
+    - **Do Not Use**:
+        - For text analysis or any request not explicitly asking for an image.
+    - **Example**:
+        - User says: "Generate an image of a futuristic city at sunset."
+          → Call this tool with prompt_text = "a futuristic city at sunset."
     """
 
     class Valves(BaseModel):
         Api_Key: Optional[str] = Field(
             None,
             description="The API token for authenticating with ComfyUI. Must be set in the Open-WebUI admin interface.",
+        )
+        ComfyUI_Server: Optional[str] = Field(
+            None,
+            description="The address of the ComfyUI server, e.g. 'myserver.ddns.net:8443'. Must be set in Open-WebUI.",
         )
 
     class UserValves(BaseModel):
@@ -66,10 +65,11 @@ class Tools:
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
 
-        # Workflow template with placeholders (paste your actual JSON here)
+        # A placeholder workflow template with placeholders
+        # Replace the empty string with your actual JSON:
         self.workflow_template = json.loads(
             """
-            {
+             {
   "6": {
     "inputs": {
       "text": "%%PROMPT%%",
@@ -263,12 +263,12 @@ class Tools:
             """
         )
 
-        # ComfyUI server configuration
-        self.server_address = "ptkwilliams.ddns.net:8443"
+        # Use the server from valves, or fall back to a default if none set
+        self.server_address = self.valves.ComfyUI_Server or "ptkwilliams.ddns.net:8443"
 
     def _replace_placeholders(self, obj, placeholders: dict):
         """
-        Replace placeholders in the workflow template with actual values.
+        Recursively replace placeholders in the workflow template with actual values.
         """
         if isinstance(obj, dict):
             return {
@@ -314,23 +314,23 @@ class Tools:
     ) -> str:
         """
         Execute the ComfyUI workflow:
-        1) Submit the prompt/workflow to /prompt
-        2) Listen on WebSocket for the finishing message
-        3) Fetch generated images from /history/<prompt_id>
-        4) Emit them as chat messages using /view URLs
+         1) Inject the user's prompt into the workflow JSON.
+         2) Submit the prompt to /prompt.
+         3) Listen on the WebSocket until generation completes.
+         4) Fetch generated images from /history/<prompt_id>.
+         5) Emit them as chat messages.
         """
-
         if not self.valves.Api_Key:
             raise ValueError(
                 "API token is not set in Valves. Please configure it in Open-WebUI."
             )
 
-        # 1) Inject the user's prompt into the workflow JSON
+        # Replace the placeholder prompt in the workflow template
         updated_workflow = self._replace_placeholders(
             self.workflow_template, {"%%PROMPT%%": prompt_text}
         )
 
-        # 2) Start connecting to the ComfyUI WebSocket
+        # Prepare WebSocket connection
         client_id = str(uuid.uuid4())
         ws_url = f"wss://{self.server_address}/ws?clientId={client_id}&token={self.valves.Api_Key}"
         logging.debug(f"Connecting to ComfyUI WebSocket at: {ws_url}")
@@ -343,6 +343,7 @@ class Tools:
                 }
             )
 
+        # Connect to WebSocket
         try:
             ws = websocket.WebSocket()
             ws.connect(ws_url, timeout=30)
@@ -371,7 +372,7 @@ class Tools:
                 )
             return f"WebSocket connection error: {e}"
 
-        # 3) Send the workflow to /prompt
+        # Submit workflow to /prompt
         try:
             prompt_id = self._queue_prompt(updated_workflow, client_id)
             logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
@@ -401,19 +402,20 @@ class Tools:
                 )
             return f"Error submitting workflow: {e}"
 
-        # 4) Wait for the finishing message (type=executing, node=None, prompt_id=...) from the WebSocket
+        # Wait for generation completion
         try:
             while True:
                 raw_msg = ws.recv()
                 if isinstance(raw_msg, bytes):
-                    # If your node sends partial image previews as binary, you could parse them here
+                    # If partial previews are sent as binary, handle them here if desired
                     continue
 
                 message_data = json.loads(raw_msg)
                 msg_type = message_data.get("type", "")
                 msg_info = message_data.get("data", {})
 
-                # Typically, ComfyUI signals completion with {"type":"executing","data":{"node":null,"prompt_id":...}}
+                # Typically, ComfyUI signals completion with:
+                # {"type":"executing","data":{"node":null,"prompt_id":...}}
                 if (
                     msg_type == "executing"
                     and msg_info.get("node") is None
@@ -424,11 +426,11 @@ class Tools:
         except Exception as e:
             logging.error(f"Error receiving WebSocket messages: {e}")
 
-        # Close the WebSocket
+        # Close WebSocket
         ws.close()
         logging.debug("WebSocket connection closed.")
 
-        # 5) Retrieve the image data from /history/<prompt_id>
+        # Retrieve images from /history/<prompt_id>
         if __event_emitter__:
             await __event_emitter__(
                 {
@@ -487,9 +489,9 @@ class Tools:
                         },
                     }
                 )
-            return "Workflow completed but no images were found in the outputs."
+            return "Workflow completed, but no images were found in the outputs."
 
-        # 6) Loop over all outputs, build /view URLs, and emit them
+        # Emit each image as a chat message
         image_count = 0
         for node_id, node_output in outputs.items():
             images_list = node_output.get("images", [])
@@ -499,13 +501,13 @@ class Tools:
                 subfolder = img_meta["subfolder"]
                 folder_type = img_meta["type"]
 
-                # Build direct URL to each image
+                # Build a direct /view URL
                 image_url = (
                     f"https://{self.server_address}/view"
                     f"?filename={filename}&subfolder={subfolder}&type={folder_type}"
                 )
 
-                # Emit as a Markdown link so that Open-WebUI shows it inline
+                # Emit as a Markdown image so Open-WebUI will display it inline
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -516,7 +518,7 @@ class Tools:
                         }
                     )
 
-        # 7) Final status update
+        # Final status update
         if __event_emitter__:
             await __event_emitter__(
                 {
