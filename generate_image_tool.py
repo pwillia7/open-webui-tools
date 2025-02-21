@@ -16,7 +16,7 @@ import base64
 import requests
 import websocket
 import logging
-from typing import Optional
+from typing import Dict, Any, Optional, List, Callable, Awaitable
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -33,8 +33,8 @@ class Tools:
         - Whenever the user explicitly requests an image:
           e.g. "Generate an image of X," "Create a flux image," "Make a flux image," etc.
     - **How to Use**:
-        - Call `run_comfyui_workflow(prompt_text=USER_PROMPT)` directly.
-        - Pass the user’s text verbatim as `prompt_text`.
+        - Call run_comfyui_workflow(prompt_text=USER_PROMPT) directly.
+        - Pass the user's text verbatim as prompt_text.
         - Do **not** ask for additional clarifications or parse the prompt.
     - **Error Handling**:
         - If the tool raises an error, return that error message verbatim so the user knows the failure reason.
@@ -42,7 +42,7 @@ class Tools:
         - For text analysis or any request not explicitly asking for an image.
     - **Example**:
         - User says: "Generate an image of a futuristic city at sunset."
-          → Call this tool with prompt_text = "a futuristic city at sunset."
+          → Call this tool with prompt_text="a futuristic city at sunset."
     """
 
     class Valves(BaseModel):
@@ -61,226 +61,247 @@ class Tools:
             description="Enable additional debug output for troubleshooting.",
         )
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
 
-        # A placeholder workflow template with placeholders
-        # Replace the empty string with your actual JSON:
-        self.workflow_template = json.loads(
+        # A placeholder workflow template with placeholders:
+        # Must parse as a dict (no union) to avoid "anyOf" in JSON schema
+        self.workflow_template: Dict[str, Any] = json.loads(
             """
-             {
-  "6": {
-    "inputs": {
-      "text": "%%PROMPT%%",
-      "clip": [
-        "11",
-        0
-      ]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Positive Prompt)"
-    }
-  },
-  "8": {
-    "inputs": {
-      "samples": [
-        "13",
-        0
-      ],
-      "vae": [
-        "10",
-        0
-      ]
-    },
-    "class_type": "VAEDecode",
-    "_meta": {
-      "title": "VAE Decode"
-    }
-  },
-  "10": {
-    "inputs": {
-      "vae_name": "ae.safetensors"
-    },
-    "class_type": "VAELoader",
-    "_meta": {
-      "title": "Load VAE"
-    }
-  },
-  "11": {
-    "inputs": {
-      "clip_name1": "t5xxl_fp8_e4m3fn.safetensors",
-      "clip_name2": "clip_l.safetensors",
-      "type": "flux"
-    },
-    "class_type": "DualCLIPLoader",
-    "_meta": {
-      "title": "DualCLIPLoader"
-    }
-  },
-  "12": {
-    "inputs": {
-      "unet_name": "flux1-schnell-fp8.safetensors",
-      "weight_dtype": "default"
-    },
-    "class_type": "UNETLoader",
-    "_meta": {
-      "title": "Load Diffusion Model"
-    }
-  },
-  "13": {
-    "inputs": {
-      "noise": [
-        "25",
-        0
-      ],
-      "guider": [
-        "22",
-        0
-      ],
-      "sampler": [
-        "16",
-        0
-      ],
-      "sigmas": [
-        "17",
-        0
-      ],
-      "latent_image": [
-        "27",
-        0
-      ]
-    },
-    "class_type": "SamplerCustomAdvanced",
-    "_meta": {
-      "title": "SamplerCustomAdvanced"
-    }
-  },
-  "16": {
-    "inputs": {
-      "sampler_name": "euler"
-    },
-    "class_type": "KSamplerSelect",
-    "_meta": {
-      "title": "KSamplerSelect"
-    }
-  },
-  "17": {
-    "inputs": {
-      "scheduler": "simple",
-      "steps": 5,
-      "denoise": 1,
-      "model": [
-        "30",
-        0
-      ]
-    },
-    "class_type": "BasicScheduler",
-    "_meta": {
-      "title": "BasicScheduler"
-    }
-  },
-  "22": {
-    "inputs": {
-      "model": [
-        "30",
-        0
-      ],
-      "conditioning": [
-        "26",
-        0
-      ]
-    },
-    "class_type": "BasicGuider",
-    "_meta": {
-      "title": "BasicGuider"
-    }
-  },
-  "25": {
-    "inputs": {
-      "noise_seed": 1119668199579776
-    },
-    "class_type": "RandomNoise",
-    "_meta": {
-      "title": "RandomNoise"
-    }
-  },
-  "26": {
-    "inputs": {
-      "guidance": 3.5,
-      "conditioning": [
-        "6",
-        0
-      ]
-    },
-    "class_type": "FluxGuidance",
-    "_meta": {
-      "title": "FluxGuidance"
-    }
-  },
-  "27": {
-    "inputs": {
-      "width": 1216,
-      "height": 832,
-      "batch_size": 1
-    },
-    "class_type": "EmptySD3LatentImage",
-    "_meta": {
-      "title": "EmptySD3LatentImage"
-    }
-  },
-  "30": {
-    "inputs": {
-      "max_shift": 1.1500000000000001,
-      "base_shift": 0.5,
-      "width": 1216,
-      "height": 832,
-      "model": [
-        "12",
-        0
-      ]
-    },
-    "class_type": "ModelSamplingFlux",
-    "_meta": {
-      "title": "ModelSamplingFlux"
-    }
-  },
-  "41": {
-    "inputs": {
-      "filename_prefix": "Fluxapi",
-      "images": [
-        "8",
-        0
-      ]
-    },
-    "class_type": "SaveImage",
-    "_meta": {
-      "title": "Save Image"
-    }
-  }
-}
+            {
+              "6": {
+                "inputs": {
+                  "text": "%%PROMPT%%",
+                  "clip": [
+                    "11",
+                    0
+                  ]
+                },
+                "class_type": "CLIPTextEncode",
+                "_meta": {
+                  "title": "CLIP Text Encode (Positive Prompt)"
+                }
+              },
+              "8": {
+                "inputs": {
+                  "samples": [
+                    "13",
+                    0
+                  ],
+                  "vae": [
+                    "10",
+                    0
+                  ]
+                },
+                "class_type": "VAEDecode",
+                "_meta": {
+                  "title": "VAE Decode"
+                }
+              },
+              "10": {
+                "inputs": {
+                  "vae_name": "ae.safetensors"
+                },
+                "class_type": "VAELoader",
+                "_meta": {
+                  "title": "Load VAE"
+                }
+              },
+              "11": {
+                "inputs": {
+                  "clip_name1": "t5xxl_fp8_e4m3fn.safetensors",
+                  "clip_name2": "clip_l.safetensors",
+                  "type": "flux"
+                },
+                "class_type": "DualCLIPLoader",
+                "_meta": {
+                  "title": "DualCLIPLoader"
+                }
+              },
+              "12": {
+                "inputs": {
+                  "unet_name": "flux1-schnell-fp8.safetensors",
+                  "weight_dtype": "default"
+                },
+                "class_type": "UNETLoader",
+                "_meta": {
+                  "title": "Load Diffusion Model"
+                }
+              },
+              "13": {
+                "inputs": {
+                  "noise": [
+                    "25",
+                    0
+                  ],
+                  "guider": [
+                    "22",
+                    0
+                  ],
+                  "sampler": [
+                    "16",
+                    0
+                  ],
+                  "sigmas": [
+                    "17",
+                    0
+                  ],
+                  "latent_image": [
+                    "27",
+                    0
+                  ]
+                },
+                "class_type": "SamplerCustomAdvanced",
+                "_meta": {
+                  "title": "SamplerCustomAdvanced"
+                }
+              },
+              "16": {
+                "inputs": {
+                  "sampler_name": "euler"
+                },
+                "class_type": "KSamplerSelect",
+                "_meta": {
+                  "title": "KSamplerSelect"
+                }
+              },
+              "17": {
+                "inputs": {
+                  "scheduler": "simple",
+                  "steps": 5,
+                  "denoise": 1,
+                  "model": [
+                    "30",
+                    0
+                  ]
+                },
+                "class_type": "BasicScheduler",
+                "_meta": {
+                  "title": "BasicScheduler"
+                }
+              },
+              "22": {
+                "inputs": {
+                  "model": [
+                    "30",
+                    0
+                  ],
+                  "conditioning": [
+                    "26",
+                    0
+                  ]
+                },
+                "class_type": "BasicGuider",
+                "_meta": {
+                  "title": "BasicGuider"
+                }
+              },
+              "25": {
+                "inputs": {
+                  "noise_seed": 1119668199579776
+                },
+                "class_type": "RandomNoise",
+                "_meta": {
+                  "title": "RandomNoise"
+                }
+              },
+              "26": {
+                "inputs": {
+                  "guidance": 3.5,
+                  "conditioning": [
+                    "6",
+                    0
+                  ]
+                },
+                "class_type": "FluxGuidance",
+                "_meta": {
+                  "title": "FluxGuidance"
+                }
+              },
+              "27": {
+                "inputs": {
+                  "width": 1216,
+                  "height": 832,
+                  "batch_size": 1
+                },
+                "class_type": "EmptySD3LatentImage",
+                "_meta": {
+                  "title": "EmptySD3LatentImage"
+                }
+              },
+              "30": {
+                "inputs": {
+                  "max_shift": 1.1500000000000001,
+                  "base_shift": 0.5,
+                  "width": 1216,
+                  "height": 832,
+                  "model": [
+                    "12",
+                    0
+                  ]
+                },
+                "class_type": "ModelSamplingFlux",
+                "_meta": {
+                  "title": "ModelSamplingFlux"
+                }
+              },
+              "41": {
+                "inputs": {
+                  "filename_prefix": "Fluxapi",
+                  "images": [
+                    "8",
+                    0
+                  ]
+                },
+                "class_type": "SaveImage",
+                "_meta": {
+                  "title": "Save Image"
+                }
+              }
+            }
             """
         )
 
         # Use the server from valves, or fall back to a default if none set
-        self.server_address = self.valves.ComfyUI_Server or "ptkwilliams.ddns.net:8443"
+        self.server_address = self.valves.ComfyUI_Server
 
-    def _replace_placeholders(self, obj, placeholders: dict):
+    def _replace_placeholders(self, data: dict, placeholders: Dict[str, str]) -> dict:
         """
-        Recursively replace placeholders in the workflow template with actual values.
+        (Private) Recursively replace '%%PLACEHOLDER%%' in string fields within a dict.
         """
-        if isinstance(obj, dict):
-            return {
-                k: self._replace_placeholders(v, placeholders) for k, v in obj.items()
-            }
-        elif isinstance(obj, list):
-            return [self._replace_placeholders(item, placeholders) for item in obj]
-        elif isinstance(obj, str):
-            for ph, val in placeholders.items():
-                obj = obj.replace(ph, val)
-            return obj
-        return obj
+        # We'll avoid a typed union here. We only publicly define dict→dict
+        # so we don't produce "anyOf" in JSON schema.
+        for key, value in data.items():
+            if isinstance(value, str):
+                for ph, replacement in placeholders.items():
+                    value = value.replace(ph, replacement)
+                data[key] = value
+            elif isinstance(value, dict):
+                data[key] = self._replace_placeholders(value, placeholders)
+            elif isinstance(value, list):
+                data[key] = [
+                    (
+                        self._replace_placeholders(item, placeholders)
+                        if isinstance(item, dict)
+                        else (
+                            # also replace placeholders in strings inside lists
+                            self._replace_string_in_list_item(item, placeholders)
+                            if isinstance(item, str)
+                            else item
+                        )
+                    )
+                    for item in value
+                ]
+        return data
+
+    def _replace_string_in_list_item(
+        self, text: str, placeholders: Dict[str, str]
+    ) -> str:
+        # Helper for strings in arrays
+        for ph, replacement in placeholders.items():
+            text = text.replace(ph, replacement)
+        return text
 
     def _queue_prompt(self, workflow: dict, client_id: str) -> str:
         """
@@ -310,25 +331,34 @@ class Tools:
     async def run_comfyui_workflow(
         self,
         prompt_text: str,
-        __event_emitter__=None,
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> str:
         """
-        Execute the ComfyUI workflow:
-         1) Inject the user's prompt into the workflow JSON.
-         2) Submit the prompt to /prompt.
-         3) Listen on the WebSocket until generation completes.
-         4) Fetch generated images from /history/<prompt_id>.
-         5) Emit them as chat messages.
+        Execute the ComfyUI workflow by:
+          1) Replacing the user's prompt into the workflow JSON.
+          2) Submitting the prompt to /prompt.
+          3) Listening on the WebSocket until generation completes.
+          4) Fetching generated images from /history/<prompt_id>.
+          5) Emitting them as chat messages.
         """
         if not self.valves.Api_Key:
             raise ValueError(
                 "API token is not set in Valves. Please configure it in Open-WebUI."
             )
 
-        # Replace the placeholder prompt in the workflow template
+        # Make a deep copy so we don't mutate self.workflow_template
+        import copy
+
+        workflow_copy = copy.deepcopy(self.workflow_template)
+
+        # Replace placeholders in place
         updated_workflow = self._replace_placeholders(
-            self.workflow_template, {"%%PROMPT%%": prompt_text}
+            workflow_copy, {"%%PROMPT%%": prompt_text}
         )
+
+        # updated_workflow must remain a dict for ComfyUI
+        if not isinstance(updated_workflow, dict):
+            raise TypeError("Workflow must be a dict after placeholders are replaced.")
 
         # Prepare WebSocket connection
         client_id = str(uuid.uuid4())
@@ -372,7 +402,7 @@ class Tools:
                 )
             return f"WebSocket connection error: {e}"
 
-        # Submit workflow to /prompt
+        # Submit the workflow
         try:
             prompt_id = self._queue_prompt(updated_workflow, client_id)
             logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
@@ -407,15 +437,13 @@ class Tools:
             while True:
                 raw_msg = ws.recv()
                 if isinstance(raw_msg, bytes):
-                    # If partial previews are sent as binary, handle them here if desired
+                    # ignore partial previews or binary
                     continue
 
                 message_data = json.loads(raw_msg)
                 msg_type = message_data.get("type", "")
                 msg_info = message_data.get("data", {})
 
-                # Typically, ComfyUI signals completion with:
-                # {"type":"executing","data":{"node":null,"prompt_id":...}}
                 if (
                     msg_type == "executing"
                     and msg_info.get("node") is None
@@ -491,7 +519,7 @@ class Tools:
                 )
             return "Workflow completed, but no images were found in the outputs."
 
-        # Emit each image as a chat message
+        # Emit each image
         image_count = 0
         for node_id, node_output in outputs.items():
             images_list = node_output.get("images", [])
@@ -501,13 +529,10 @@ class Tools:
                 subfolder = img_meta["subfolder"]
                 folder_type = img_meta["type"]
 
-                # Build a direct /view URL
                 image_url = (
                     f"https://{self.server_address}/view"
                     f"?filename={filename}&subfolder={subfolder}&type={folder_type}"
                 )
-
-                # Emit as a Markdown image so Open-WebUI will display it inline
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -518,7 +543,7 @@ class Tools:
                         }
                     )
 
-        # Final status update
+        # Final status
         if __event_emitter__:
             await __event_emitter__(
                 {

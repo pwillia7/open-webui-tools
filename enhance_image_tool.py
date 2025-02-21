@@ -2,11 +2,11 @@
 title: ComfyUI Flux Image Enhancer
 Author: Patrick Williams
 author_url: https://reticulated.net
-git_url: https://github.com/pwillia7/open-webui-tools
+git_url: https://github.com/username/comfyui-workflow-runner.git
 description: Submits an img2img node-based ComfyUI workflow over HTTP, then listens on the WebSocket for images. Embeds them in chat.
 required_open_webui_version: 0.4.0
 requirements: requests, langchain-openai, langgraph, ollama, langchain_ollama, websocket-client
-version: 1.0.0
+version: 1.1.1
 license: MIT
 """
 
@@ -16,7 +16,7 @@ import base64
 import requests
 import websocket
 import logging
-from typing import Optional
+from typing import Dict, Any, Optional, List, Callable, Awaitable
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -33,27 +33,31 @@ class Tools:
           (img2img workflow in ComfyUI).
         - Example triggers: "Enhance this image," "Make variations of this image," "Refine this image," etc.
     - **How to Use**:
-        - Provide the user’s instructions for how to modify/enhance the image via `prompt_text`. (Optional)
-        - Provide the user’s image URL in `image_url`.
-        - Provide the node ID or the placeholder key in `target_node` where the base64 image is injected.
-          (The actual workflow must have `%%B64IMAGE%%` in that node’s input value.)
-        - Optionally pass a maximum number of images to return (`max_returned_images`).
+        - Provide user’s instructions for how to modify/enhance the image via prompt_text (if any).
+        - Provide the user’s image URL in image_url.
+        - Provide the node ID (or placeholder key) in target_node where the base64 image is injected.
+          (The actual workflow must have %%B64IMAGE%% in that node’s input value.)
+        - Optionally pass a maximum number of images to return via max_returned_images.
     - **Behavior**:
         - Fetches the image from the provided URL and base64-encodes it.
-        - Substitutes `%%B64IMAGE%%` (and optionally `%%PROMPT%%`) in the workflow JSON.
+        - Substitutes %%B64IMAGE%% (and optionally %%PROMPT%%) in the workflow JSON.
         - Sends the updated workflow to the ComfyUI server over HTTP.
         - Waits on a WebSocket for completion signals.
-        - Retrieves the final images from ComfyUI’s `/history/<prompt_id>` endpoint.
-        - Emits the images back into chat as Markdown image links (optionally limited to the last N).
+        - Retrieves final images from ComfyUI’s /history/<prompt_id> endpoint.
+        - Emits images back into chat (optionally limited to last N).
     - **Important**:
-        - Call this tool only if the user explicitly wants to do an img2img operation (enhance or modify an existing image).
-        - Do not use for simple text-to-image requests; that’s the other tool.
+        - Only use this tool for an img2img operation (enhance/modify an existing image).
+        - Do not use for text-to-image requests (use the other tool).
     """
 
     class Valves(BaseModel):
         Api_Key: Optional[str] = Field(
             None,
-            description="The API token for authenticating with ComfyUI. Must be set in the Open-WebUI admin interface.",
+            description="API token for ComfyUI. Set in the Open-WebUI admin interface.",
+        )
+        Server_Address: Optional[str] = Field(
+            None,
+            description="ComfyUI server address, e.g. 'localhost:8443'. Must be set in Open-WebUI.",
         )
 
     class UserValves(BaseModel):
@@ -62,17 +66,16 @@ class Tools:
             description="Enable additional debug output for troubleshooting.",
         )
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
 
-        # Paste your actual ComfyUI workflow JSON here, with placeholders:
-        #   "%%PROMPT%%" for user prompt (if needed)
-        #   "%%B64IMAGE%%" for the base64-encoded image
-        # Ensure that this JSON does NOT contain any comments.
-        self.workflow_template = json.loads(
+        # The ComfyUI workflow template (dict). Contains placeholders:
+        #   %%B64IMAGE%% => base64-encoded image
+        #   %%PROMPT%%   => user instructions
+        self.workflow_template: Dict[str, Any] = json.loads(
             """
-                 {
+                              {
   "4": {
     "inputs": {
       "ckpt_name": "sleipnirTLHTurbo_v27TLHFP32Main.safetensors"
@@ -1132,49 +1135,53 @@ class Tools:
       "title": "Load Image (Base64)"
     }
   }
-}
+}              
             """
         )
 
-        # ComfyUI server config
-        self.server_address = "ptkwilliams.ddns.net:8443"
-
-    def _replace_placeholders(self, obj, placeholders: dict):
-        """
-        Replace placeholders in the workflow template with actual values.
-        """
-        if isinstance(obj, dict):
-            return {
-                k: self._replace_placeholders(v, placeholders) for k, v in obj.items()
-            }
-        elif isinstance(obj, list):
-            return [self._replace_placeholders(item, placeholders) for item in obj]
-        elif isinstance(obj, str):
-            for ph, val in placeholders.items():
-                obj = obj.replace(ph, val)
-            return obj
-        return obj
+    def _replace_placeholders(self, data: dict, placeholders: Dict[str, str]) -> dict:
+        """Recursively replace placeholders in the workflow dict."""
+        for key, value in data.items():
+            if isinstance(value, str):
+                for ph, replacement in placeholders.items():
+                    value = value.replace(ph, replacement)
+                data[key] = value
+            elif isinstance(value, dict):
+                data[key] = self._replace_placeholders(value, placeholders)
+            elif isinstance(value, list):
+                new_list = []
+                for item in value:
+                    if isinstance(item, dict):
+                        new_list.append(self._replace_placeholders(item, placeholders))
+                    elif isinstance(item, str):
+                        for ph, replacement in placeholders.items():
+                            item = item.replace(ph, replacement)
+                        new_list.append(item)
+                    else:
+                        new_list.append(item)
+                data[key] = new_list
+        return data
 
     def _queue_prompt(self, workflow: dict, client_id: str) -> str:
         """
-        Submit the workflow to the ComfyUI API with the token included in the Authorization header.
+        Submit the workflow to ComfyUI using the token in Authorization header.
         """
         if not self.valves.Api_Key:
-            raise ValueError(
-                "API token is not set in Valves. Please configure it in Open-WebUI."
-            )
+            raise ValueError("API token not set. Configure it in Open-WebUI.")
+        if not self.valves.Server_Address:
+            raise ValueError("Server address not set. Configure it in Open-WebUI.")
 
-        url = f"https://{self.server_address}/prompt"
+        url = f"https://{self.valves.Server_Address}/prompt"
         headers = {"Authorization": f"Bearer {self.valves.Api_Key}"}
         body = {"prompt": workflow, "client_id": client_id}
 
         logging.debug(f"Submitting API request to {url}")
-        logging.debug(f"Request Headers: {headers}")
-        logging.debug(f"Request Body: {json.dumps(body)}")
+        logging.debug(f"Headers: {headers}")
+        logging.debug(f"Body: {json.dumps(body)}")
 
         resp = requests.post(url, json=body, headers=headers, timeout=30)
         logging.debug(f"Response Headers: {resp.headers}")
-        logging.debug(f"Response Status Code: {resp.status_code}")
+        logging.debug(f"Status Code: {resp.status_code}")
         logging.debug(f"Response Body: {resp.text}")
 
         resp.raise_for_status()
@@ -1183,38 +1190,41 @@ class Tools:
     async def run_comfyui_img2img_workflow(
         self,
         image_url: str,
-        prompt_text: Optional[str] = None,
+        prompt_text: str = "",  # <--- MAKE THIS A STRING, NO anyOf
         target_node: str = "%%B64IMAGE%%",
         max_returned_images: int = 5,
-        __event_emitter__=None,
+        __event_emitter__: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> str:
         """
-        Execute the ComfyUI img2img workflow:
-        1) Fetch & base64-encode the user’s image from `image_url`.
-        2) Emit the original image to the chat.
-        3) Replace placeholders in the workflow JSON:
-           - %%B64IMAGE%% with the encoded image
-           - %%PROMPT%% with the user instructions (if provided)
-        4) Submit the workflow to /prompt
-        5) Listen on WebSocket for generation to finish
-        6) Fetch generated images from /history/<prompt_id>
-        7) Emit them as messages (optionally limit to the last N).
+        Run the ComfyUI img2img workflow:
+         1) Fetch & base64-encode the user’s image at image_url.
+         2) Show the original image in chat.
+         3) Replace placeholders in the workflow JSON.
+         4) Submit the updated workflow to /prompt.
+         5) Listen on WebSocket until generation finishes.
+         6) Fetch & emit generated images.
         """
         if not self.valves.Api_Key:
+            raise ValueError("API token not set in Valves. Configure it in Open-WebUI.")
+        if not self.valves.Server_Address:
             raise ValueError(
-                "API token is not set in Valves. Please configure it in Open-WebUI."
+                "Server address not set in Valves. Configure it in Open-WebUI."
             )
 
-        # 1) Fetch the user’s image & convert to base64
+        # 1) Fetch user’s image & encode
         try:
-            resp = requests.get(image_url, timeout=30)
+            headers = {
+                "User-Agent": "open-webui-tools/1.0 (+https://github.com/pwillia7/open-webui-tools)"
+            }
+            resp = requests.get(image_url, headers=headers, timeout=30)
             resp.raise_for_status()
             b64_image = base64.b64encode(resp.content).decode("utf-8")
+            logging.debug(f"Image fetched & base64-encoded from {image_url}")
         except Exception as e:
-            logging.error(f"Failed to fetch or encode image from {image_url}: {e}")
+            logging.error(f"Failed to fetch image at {image_url}: {e}")
             return f"Error fetching image: {e}"
 
-        # 2) Emit the original image to the chat
+        # 2) Emit original image
         if __event_emitter__:
             await __event_emitter__(
                 {
@@ -1225,22 +1235,20 @@ class Tools:
                 }
             )
 
-        # 3) Inject placeholders
-        placeholders = {
-            "%%B64IMAGE%%": b64_image,
-        }
-        # Only add %%PROMPT%% if we actually have a prompt text
-        if prompt_text is not None:
+        # 3) Replace placeholders in workflow
+        placeholders = {target_node: b64_image}
+        if prompt_text:
             placeholders["%%PROMPT%%"] = prompt_text
 
-        updated_workflow = self._replace_placeholders(
-            self.workflow_template, placeholders
-        )
+        import copy
 
-        # 4) Connect to ComfyUI WebSocket
+        workflow_copy = copy.deepcopy(self.workflow_template)
+        updated_workflow = self._replace_placeholders(workflow_copy, placeholders)
+
+        # 4) Connect WebSocket
         client_id = str(uuid.uuid4())
-        ws_url = f"wss://{self.server_address}/ws?clientId={client_id}&token={self.valves.Api_Key}"
-        logging.debug(f"Connecting to ComfyUI WebSocket at: {ws_url}")
+        ws_url = f"wss://{self.valves.Server_Address}/ws?clientId={client_id}&token={self.valves.Api_Key}"
+        logging.debug(f"Connecting WebSocket: {ws_url}")
 
         if __event_emitter__:
             await __event_emitter__(
@@ -1253,36 +1261,35 @@ class Tools:
         try:
             ws = websocket.WebSocket()
             ws.connect(ws_url, timeout=30)
-            logging.debug("WebSocket connection established.")
+            logging.debug("WebSocket connected.")
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": "Connected! Submitting img2img workflow...",
+                            "description": "Connected! Submitting workflow...",
                             "done": False,
                         },
                     }
                 )
         except Exception as e:
-            logging.error(f"WebSocket connection failed: {e}")
+            logging.error(f"WebSocket error: {e}")
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"Could not connect to ComfyUI WebSocket: {e}",
+                            "description": f"Could not connect WebSocket: {e}",
                             "done": True,
                         },
                     }
                 )
             return f"WebSocket connection error: {e}"
 
-        # 5) Send the workflow to /prompt
+        # 5) Submit workflow
         try:
             prompt_id = self._queue_prompt(updated_workflow, client_id)
-            logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
-
+            logging.debug(f"Workflow submitted: prompt_id={prompt_id}")
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -1308,33 +1315,32 @@ class Tools:
                 )
             return f"Error submitting workflow: {e}"
 
-        # 6) Wait for the finishing message (type=executing, node=None, prompt_id=...)
+        # Listen until generation finishes
         try:
             while True:
                 raw_msg = ws.recv()
                 if isinstance(raw_msg, bytes):
-                    # If partial images or previews are sent as binary, handle here if desired
                     continue
+                msg_data = json.loads(raw_msg)
+                msg_type = msg_data.get("type", "")
+                msg_info = msg_data.get("data", {})
 
-                message_data = json.loads(raw_msg)
-                msg_type = message_data.get("type", "")
-                msg_info = message_data.get("data", {})
-
+                # ComfyUI signals completion with {type:"executing", data:{node:null, prompt_id:...}}
                 if (
                     msg_type == "executing"
                     and msg_info.get("node") is None
                     and msg_info.get("prompt_id") == prompt_id
                 ):
-                    logging.debug("ComfyUI signaled that generation is complete.")
+                    logging.debug("ComfyUI signaled generation is complete.")
                     break
         except Exception as e:
-            logging.error(f"Error receiving WebSocket messages: {e}")
+            logging.error(f"WebSocket receive error: {e}")
 
-        # Close the WebSocket
+        # Close WebSocket
         ws.close()
-        logging.debug("WebSocket connection closed.")
+        logging.debug("WebSocket closed.")
 
-        # 7) Retrieve the image data from /history/<prompt_id>
+        # 6) Retrieve final images from /history/<prompt_id>
         if __event_emitter__:
             await __event_emitter__(
                 {
@@ -1346,14 +1352,14 @@ class Tools:
                 }
             )
 
-        history_url = f"https://{self.server_address}/history/{prompt_id}"
+        history_url = f"https://{self.valves.Server_Address}/history/{prompt_id}"
         headers = {"Authorization": f"Bearer {self.valves.Api_Key}"}
 
         try:
             resp = requests.get(history_url, headers=headers, timeout=30)
             resp.raise_for_status()
             history_data = resp.json()
-            logging.debug(f"History data retrieved: {history_data}")
+            logging.debug(f"History data: {history_data}")
         except Exception as e:
             logging.error(f"Error fetching /history data: {e}")
             if __event_emitter__:
@@ -1379,7 +1385,7 @@ class Tools:
                         },
                     }
                 )
-            return "Workflow completed, but no history data was found for this prompt."
+            return "No history found for this prompt."
 
         outputs = history_data[prompt_id].get("outputs", {})
         if not outputs:
@@ -1393,44 +1399,40 @@ class Tools:
                         },
                     }
                 )
-            return "Workflow completed but no images were found in the outputs."
+            return "Workflow completed, but no images found in outputs."
 
-        # Collect all images from all output nodes
+        # Gather images from all output nodes
         all_images = []
-        for node_id, node_output in outputs.items():
+        for _, node_output in outputs.items():
             images_list = node_output.get("images", [])
             all_images.extend(images_list)
 
-        # If max_returned_images > 0, only keep the last N images
+        # Keep only last N if max_returned_images > 0
         if max_returned_images > 0:
             all_images = all_images[-max_returned_images:]
 
-        # Emit the images in chat
         image_count = 0
         for i, img_meta in enumerate(all_images, start=1):
-            image_count += 1
             filename = img_meta["filename"]
             subfolder = img_meta["subfolder"]
             folder_type = img_meta["type"]
-
-            # Build direct URL to each image
-            final_image_url = (
-                f"https://{self.server_address}/view"
+            final_url = (
+                f"https://{self.valves.Server_Address}/view"
                 f"?filename={filename}&subfolder={subfolder}&type={folder_type}"
             )
+            image_count += 1
 
-            # Emit as a Markdown link so that Open-WebUI shows it inline
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "message",
                         "data": {
-                            "content": f"**Enhanced Image #{i}:** ![Preview]({final_image_url})"
+                            "content": f"**Enhanced Image #{i}:** ![Preview]({final_url})"
                         },
                     }
                 )
 
-        # Final status update
+        # Final status
         if __event_emitter__:
             await __event_emitter__(
                 {

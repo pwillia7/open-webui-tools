@@ -1,5 +1,7 @@
 # open-webui-tools
 
+NOTE: the *_template.py files are currently broken due to an update with OWUI -- Use the other 2 files and repurpose them. 
+
 **open-webui-tools** is a repository that provides tools and templates for integrating ComfyUI workflows with Open-WebUI. It includes both **txt2img** and **img2img** functionalities, enabling users to generate images from text prompts or enhance existing images seamlessly.
 
 ## 🛠️ Features
