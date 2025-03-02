@@ -14,7 +14,8 @@ import uuid
 import json
 import base64
 import requests
-import websocket
+import asyncio
+import websockets
 import logging
 from typing import Dict, Any, Optional, List, Callable, Awaitable
 from pydantic import BaseModel, Field
@@ -375,19 +376,67 @@ class Tools:
 
         # Connect to WebSocket
         try:
-            ws = websocket.WebSocket()
-            ws.connect(ws_url, timeout=30)
-            logging.debug("WebSocket connection established.")
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "Connected! Submitting workflow...",
-                            "done": False,
-                        },
-                    }
-                )
+            async with websockets.connect(ws_url) as ws:
+                logging.debug("WebSocket connection established.")
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "Connected! Submitting workflow...",
+                                "done": False,
+                            },
+                        }
+                    )
+
+                # Submit the workflow
+                try:
+                    prompt_id = self._queue_prompt(updated_workflow, client_id)
+                    logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": "Workflow submitted. Waiting for video generation...",
+                                    "done": False,
+                                },
+                            }
+                        )
+                except Exception as e:
+                    logging.error(f"Error submitting workflow: {e}")
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"Workflow submission failed: {e}",
+                                    "done": True,
+                                },
+                            }
+                        )
+                    return f"Error submitting workflow: {e}"
+
+                # Wait for generation completion
+                try:
+                    async for raw_msg in ws:
+                        if isinstance(raw_msg, bytes):
+                            continue
+                        message_data = json.loads(raw_msg)
+                        msg_type = message_data.get("type", "")
+                        msg_info = message_data.get("data", {})
+                        if (
+                            msg_type == "executing"
+                            and msg_info.get("node") is None
+                            and msg_info.get("prompt_id") == prompt_id
+                        ):
+                            logging.debug(
+                                "ComfyUI signaled that generation is complete."
+                            )
+                            break
+                except Exception as e:
+                    logging.error(f"Error receiving WebSocket messages: {e}")
+
         except Exception as e:
             logging.error(f"WebSocket connection failed: {e}")
             if __event_emitter__:
@@ -401,62 +450,6 @@ class Tools:
                     }
                 )
             return f"WebSocket connection error: {e}"
-
-        # Submit the workflow
-        try:
-            prompt_id = self._queue_prompt(updated_workflow, client_id)
-            logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
-
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "Workflow submitted. Waiting for image generation...",
-                            "done": False,
-                        },
-                    }
-                )
-        except Exception as e:
-            ws.close()
-            logging.error(f"Error submitting workflow: {e}")
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Workflow submission failed: {e}",
-                            "done": True,
-                        },
-                    }
-                )
-            return f"Error submitting workflow: {e}"
-
-        # Wait for generation completion
-        try:
-            while True:
-                raw_msg = ws.recv()
-                if isinstance(raw_msg, bytes):
-                    # ignore partial previews or binary
-                    continue
-
-                message_data = json.loads(raw_msg)
-                msg_type = message_data.get("type", "")
-                msg_info = message_data.get("data", {})
-
-                if (
-                    msg_type == "executing"
-                    and msg_info.get("node") is None
-                    and msg_info.get("prompt_id") == prompt_id
-                ):
-                    logging.debug("ComfyUI signaled that generation is complete.")
-                    break
-        except Exception as e:
-            logging.error(f"Error receiving WebSocket messages: {e}")
-
-        # Close WebSocket
-        ws.close()
-        logging.debug("WebSocket connection closed.")
 
         # Retrieve images from /history/<prompt_id>
         if __event_emitter__:
