@@ -1,12 +1,12 @@
 """
-title: ComfyUI Flux Image Maker
+title: Txt2Img Comfy Tool
 Author: Patrick Williams
 author_url: https://reticulated.net
-git_url: https://github.com/pwillia7/open-webui-tools
-description: Submits a node-based ComfyUI workflow over HTTP, then listens on the WebSocket for images from SaveImageWebsocket node. Embeds them in chat.
+git_url: https://github.com/pwillia7/open-webui-tools.git
+description: Submits a txt2img node-based ComfyUI workflow over HTTPS by replacing the %%PROMPT%% placeholder with the user's input. It then listens on the WebSocket until generation completes and retrieves final images from /history.
 required_open_webui_version: 0.4.0
-requirements: requests, langchain-openai, langgraph, ollama, langchain_ollama, websocket-client
-version: 1.0.1
+requirements: requests, websocket-client
+version: 1.0.0
 license: MIT
 """
 
@@ -17,7 +17,7 @@ import requests
 import asyncio
 import websockets
 import logging
-from typing import Dict, Any, Optional, List, Callable, Awaitable
+from typing import Dict, Any, Optional, Callable, Awaitable
 from pydantic import BaseModel, Field
 
 # Configure logging
@@ -29,34 +29,29 @@ logging.basicConfig(
 class Tools:
     """
     [LLM Usage Directive]:
-    - **Purpose**: This tool generates images using ComfyUI with a node-based workflow.
+    - **Purpose**: This tool generates images using a node-based ComfyUI workflow.
     - **When to Use**:
-        - Whenever the user explicitly requests an image:
-          e.g. "Generate an image of X," "Create a flux image," "Make a flux image," etc.
+         e.g. "Generate an image of a futuristic city at sunset."
     - **How to Use**:
-        - Call run_comfyui_workflow(prompt_text=USER_PROMPT) directly.
-        - Pass the user's text verbatim as prompt_text.
-        - Do **not** ask for additional clarifications or parse the prompt.
+         Call run_comfyui_workflow(prompt_text=USER_PROMPT) directly.
     - **Error Handling**:
-        - If the tool raises an error, return that error message verbatim so the user knows the failure reason.
-    - **Do Not Use**:
-        - For text analysis or any request not explicitly asking for an image.
-    - **Example**:
-        - User says: "Generate an image of a futuristic city at sunset."
-          → Call this tool with prompt_text="a futuristic city at sunset."
+         Returns error messages verbatim.
     """
 
+    # All configuration now lives under Valves (admin-only settings)
     class Valves(BaseModel):
         Api_Key: Optional[str] = Field(
             None,
             description="The API token for authenticating with ComfyUI. Must be set in the Open-WebUI admin interface.",
         )
         ComfyUI_Server: Optional[str] = Field(
-            None,
-            description="The address of the ComfyUI server, e.g. 'myserver.ddns.net:8443'. Must be set in Open-WebUI.",
+            "ptkwilliams.ddns.net:8443",
+            description="The address of the ComfyUI server, e.g. 'localhost:8188'. Must be set in Open-WebUI.",
         )
-
-    class UserValves(BaseModel):
+        Workflow_URL: Optional[str] = Field(
+            "https://gist.githubusercontent.com/pwillia7/9fe756338c7d35eba130c68408b705f4/raw/4a429e1ede948e02e405e3a046b2eb85546f1c0f/fluxgen",
+            description="The URL where the ComfyUI workflow JSON is hosted.",
+        )
         debug_mode: bool = Field(
             default=False,
             description="Enable additional debug output for troubleshooting.",
@@ -64,215 +59,31 @@ class Tools:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
-        self.user_valves = self.UserValves()
 
-        # A placeholder workflow template with placeholders:
-        # Must parse as a dict (no union) to avoid "anyOf" in JSON schema
-        self.workflow_template: Dict[str, Any] = json.loads(
-            """
-            {
-              "6": {
-                "inputs": {
-                  "text": "%%PROMPT%%",
-                  "clip": [
-                    "11",
-                    0
-                  ]
-                },
-                "class_type": "CLIPTextEncode",
-                "_meta": {
-                  "title": "CLIP Text Encode (Positive Prompt)"
-                }
-              },
-              "8": {
-                "inputs": {
-                  "samples": [
-                    "13",
-                    0
-                  ],
-                  "vae": [
-                    "10",
-                    0
-                  ]
-                },
-                "class_type": "VAEDecode",
-                "_meta": {
-                  "title": "VAE Decode"
-                }
-              },
-              "10": {
-                "inputs": {
-                  "vae_name": "ae.safetensors"
-                },
-                "class_type": "VAELoader",
-                "_meta": {
-                  "title": "Load VAE"
-                }
-              },
-              "11": {
-                "inputs": {
-                  "clip_name1": "t5xxl_fp8_e4m3fn.safetensors",
-                  "clip_name2": "clip_l.safetensors",
-                  "type": "flux"
-                },
-                "class_type": "DualCLIPLoader",
-                "_meta": {
-                  "title": "DualCLIPLoader"
-                }
-              },
-              "12": {
-                "inputs": {
-                  "unet_name": "flux1-schnell-fp8.safetensors",
-                  "weight_dtype": "default"
-                },
-                "class_type": "UNETLoader",
-                "_meta": {
-                  "title": "Load Diffusion Model"
-                }
-              },
-              "13": {
-                "inputs": {
-                  "noise": [
-                    "25",
-                    0
-                  ],
-                  "guider": [
-                    "22",
-                    0
-                  ],
-                  "sampler": [
-                    "16",
-                    0
-                  ],
-                  "sigmas": [
-                    "17",
-                    0
-                  ],
-                  "latent_image": [
-                    "27",
-                    0
-                  ]
-                },
-                "class_type": "SamplerCustomAdvanced",
-                "_meta": {
-                  "title": "SamplerCustomAdvanced"
-                }
-              },
-              "16": {
-                "inputs": {
-                  "sampler_name": "euler"
-                },
-                "class_type": "KSamplerSelect",
-                "_meta": {
-                  "title": "KSamplerSelect"
-                }
-              },
-              "17": {
-                "inputs": {
-                  "scheduler": "simple",
-                  "steps": 5,
-                  "denoise": 1,
-                  "model": [
-                    "30",
-                    0
-                  ]
-                },
-                "class_type": "BasicScheduler",
-                "_meta": {
-                  "title": "BasicScheduler"
-                }
-              },
-              "22": {
-                "inputs": {
-                  "model": [
-                    "30",
-                    0
-                  ],
-                  "conditioning": [
-                    "26",
-                    0
-                  ]
-                },
-                "class_type": "BasicGuider",
-                "_meta": {
-                  "title": "BasicGuider"
-                }
-              },
-              "25": {
-                "inputs": {
-                  "noise_seed": 1119668199579776
-                },
-                "class_type": "RandomNoise",
-                "_meta": {
-                  "title": "RandomNoise"
-                }
-              },
-              "26": {
-                "inputs": {
-                  "guidance": 3.5,
-                  "conditioning": [
-                    "6",
-                    0
-                  ]
-                },
-                "class_type": "FluxGuidance",
-                "_meta": {
-                  "title": "FluxGuidance"
-                }
-              },
-              "27": {
-                "inputs": {
-                  "width": 1216,
-                  "height": 832,
-                  "batch_size": 1
-                },
-                "class_type": "EmptySD3LatentImage",
-                "_meta": {
-                  "title": "EmptySD3LatentImage"
-                }
-              },
-              "30": {
-                "inputs": {
-                  "max_shift": 1.1500000000000001,
-                  "base_shift": 0.5,
-                  "width": 1216,
-                  "height": 832,
-                  "model": [
-                    "12",
-                    0
-                  ]
-                },
-                "class_type": "ModelSamplingFlux",
-                "_meta": {
-                  "title": "ModelSamplingFlux"
-                }
-              },
-              "41": {
-                "inputs": {
-                  "filename_prefix": "Fluxapi",
-                  "images": [
-                    "8",
-                    0
-                  ]
-                },
-                "class_type": "SaveImage",
-                "_meta": {
-                  "title": "Save Image"
-                }
-              }
-            }
-            """
-        )
-
-        # Use the server from valves, or fall back to a default if none set
+        if not self.valves.ComfyUI_Server:
+            raise ValueError(
+                "ComfyUI server address is not set in Valves. Please configure it in Open-WebUI."
+            )
+        # Use the exact value from the valve
         self.server_address = self.valves.ComfyUI_Server
+
+        if not self.valves.Workflow_URL:
+            raise ValueError(
+                "Workflow URL is not set in Valves. Please configure it in Open-WebUI."
+            )
+        try:
+            response = requests.get(self.valves.Workflow_URL, timeout=30)
+            response.raise_for_status()
+            self.workflow_template: Dict[str, Any] = response.json()
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load workflow from URL {self.valves.Workflow_URL}: {e}"
+            )
 
     def _replace_placeholders(self, data: dict, placeholders: Dict[str, str]) -> dict:
         """
-        (Private) Recursively replace '%%PLACEHOLDER%%' in string fields within a dict.
+        Recursively replace '%%PLACEHOLDER%%' in string fields within a dict.
         """
-        # We'll avoid a typed union here. We only publicly define dict→dict
-        # so we don't produce "anyOf" in JSON schema.
         for key, value in data.items():
             if isinstance(value, str):
                 for ph, replacement in placeholders.items():
@@ -286,7 +97,6 @@ class Tools:
                         self._replace_placeholders(item, placeholders)
                         if isinstance(item, dict)
                         else (
-                            # also replace placeholders in strings inside lists
                             self._replace_string_in_list_item(item, placeholders)
                             if isinstance(item, str)
                             else item
@@ -299,20 +109,19 @@ class Tools:
     def _replace_string_in_list_item(
         self, text: str, placeholders: Dict[str, str]
     ) -> str:
-        # Helper for strings in arrays
         for ph, replacement in placeholders.items():
             text = text.replace(ph, replacement)
         return text
 
     def _queue_prompt(self, workflow: dict, client_id: str) -> str:
         """
-        Submit the workflow to the ComfyUI API with the token included in the Authorization header.
+        Submit the workflow to the ComfyUI API.
+        The API token is sent as a Bearer token in the Authorization header.
         """
         if not self.valves.Api_Key:
             raise ValueError(
                 "API token is not set in Valves. Please configure it in Open-WebUI."
             )
-
         url = f"https://{self.server_address}/prompt"
         headers = {"Authorization": f"Bearer {self.valves.Api_Key}"}
         body = {"prompt": workflow, "client_id": client_id}
@@ -336,7 +145,7 @@ class Tools:
     ) -> str:
         """
         Execute the ComfyUI workflow by:
-          1) Replacing the user's prompt into the workflow JSON.
+          1) Replacing %%PROMPT%% in the workflow JSON with the user's prompt.
           2) Submitting the prompt to /prompt.
           3) Listening on the WebSocket until generation completes.
           4) Fetching generated images from /history/<prompt_id>.
@@ -347,25 +156,25 @@ class Tools:
                 "API token is not set in Valves. Please configure it in Open-WebUI."
             )
 
-        # Make a deep copy so we don't mutate self.workflow_template
         import copy
 
-        workflow_copy = copy.deepcopy(self.workflow_template)
+        logging.debug(f"Using user prompt: {prompt_text}")
 
-        # Replace placeholders in place
+        workflow_copy = copy.deepcopy(self.workflow_template)
         updated_workflow = self._replace_placeholders(
             workflow_copy, {"%%PROMPT%%": prompt_text}
         )
-
-        # updated_workflow must remain a dict for ComfyUI
         if not isinstance(updated_workflow, dict):
             raise TypeError("Workflow must be a dict after placeholders are replaced.")
 
-        # Prepare WebSocket connection
         client_id = str(uuid.uuid4())
-        ws_url = f"wss://{self.server_address}/ws?clientId={client_id}&token={self.valves.Api_Key}"
-        logging.debug(f"Connecting to ComfyUI WebSocket at: {ws_url}")
 
+        # Build the WebSocket URL exactly as in the working tool.
+        ws_url = f"wss://{self.valves.ComfyUI_Server}/ws?clientId={client_id}"
+        if self.valves.Api_Key:
+            ws_url += f"&token={self.valves.Api_Key}"
+
+        logging.debug(f"Connecting WebSocket to: {ws_url}")
         if __event_emitter__:
             await __event_emitter__(
                 {
@@ -374,7 +183,6 @@ class Tools:
                 }
             )
 
-        # Connect to WebSocket
         try:
             async with websockets.connect(ws_url) as ws:
                 logging.debug("WebSocket connection established.")
@@ -389,7 +197,6 @@ class Tools:
                         }
                     )
 
-                # Submit the workflow
                 try:
                     prompt_id = self._queue_prompt(updated_workflow, client_id)
                     logging.debug(f"Workflow submitted. prompt_id={prompt_id}")
@@ -398,7 +205,7 @@ class Tools:
                             {
                                 "type": "status",
                                 "data": {
-                                    "description": "Workflow submitted. Waiting for video generation...",
+                                    "description": "Workflow submitted. Waiting for generation...",
                                     "done": False,
                                 },
                             }
@@ -417,7 +224,6 @@ class Tools:
                         )
                     return f"Error submitting workflow: {e}"
 
-                # Wait for generation completion
                 try:
                     async for raw_msg in ws:
                         if isinstance(raw_msg, bytes):
@@ -427,8 +233,8 @@ class Tools:
                         msg_info = message_data.get("data", {})
                         if (
                             msg_type == "executing"
-                            and msg_info.get("node") is None
                             and msg_info.get("prompt_id") == prompt_id
+                            and msg_info.get("node") is None
                         ):
                             logging.debug(
                                 "ComfyUI signaled that generation is complete."
@@ -436,7 +242,6 @@ class Tools:
                             break
                 except Exception as e:
                     logging.error(f"Error receiving WebSocket messages: {e}")
-
         except Exception as e:
             logging.error(f"WebSocket connection failed: {e}")
             if __event_emitter__:
@@ -451,23 +256,20 @@ class Tools:
                 )
             return f"WebSocket connection error: {e}"
 
-        # Retrieve images from /history/<prompt_id>
         if __event_emitter__:
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": "ComfyUI generation complete. Retrieving images...",
+                        "description": "Generation complete. Retrieving images...",
                         "done": False,
                     },
                 }
             )
 
-        history_url = f"https://{self.server_address}/history/{prompt_id}"
-        headers = {"Authorization": f"Bearer {self.valves.Api_Key}"}
-
+        history_url = f"https://{self.valves.ComfyUI_Server}/history/{prompt_id}?token={self.valves.Api_Key}"
         try:
-            resp = requests.get(history_url, headers=headers, timeout=30)
+            resp = requests.get(history_url, timeout=30)
             resp.raise_for_status()
             history_data = resp.json()
             logging.debug(f"History data retrieved: {history_data}")
@@ -512,7 +314,6 @@ class Tools:
                 )
             return "Workflow completed, but no images were found in the outputs."
 
-        # Emit each image
         image_count = 0
         for node_id, node_output in outputs.items():
             images_list = node_output.get("images", [])
@@ -521,11 +322,7 @@ class Tools:
                 filename = img_meta["filename"]
                 subfolder = img_meta["subfolder"]
                 folder_type = img_meta["type"]
-
-                image_url = (
-                    f"https://{self.server_address}/view"
-                    f"?filename={filename}&subfolder={subfolder}&type={folder_type}"
-                )
+                image_url = f"https://{self.valves.ComfyUI_Server}/view?filename={filename}&subfolder={subfolder}&type={folder_type}&token={self.valves.Api_Key}"
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -536,7 +333,6 @@ class Tools:
                         }
                     )
 
-        # Final status
         if __event_emitter__:
             await __event_emitter__(
                 {
